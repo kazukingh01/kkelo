@@ -66,11 +66,22 @@ class Elo:
             if x not in self.rating:
                 self.rating[x] = float(y)
 
-    def ratings(self, *teams: str | list[str]) -> tuple[list[list[str]], list[list[float]]]:
+    def ratings(self, *teams: str | list[str] | np.ndarray) -> tuple[None | list[list[str]], np.ndarray | list[list[float]]]:
+        is_np = (len(teams) == 1 and isinstance(teams[0], np.ndarray))
+        if is_np: teams = teams[0]
         if self.is_check:
-            assert check_type_list(teams, [list, str], str)
-        teams = [x if isinstance(x, (tuple, list)) else [x, ] for x in teams]
-        return teams, [[self.rating[y] for y in x] for x in teams]
+            if is_np:
+                assert len(teams.shape) in [1, 2]
+                assert np.issubdtype(teams.dtype, np.str_)
+            else:
+                assert check_type_list(teams, [list, str], str)
+        if is_np:
+            se      = pd.Series(self.rating)
+            ratings = se[teams.reshape(-1)].values.reshape(teams.shape)
+            return None, ratings
+        else:
+            teams = [x if isinstance(x, (tuple, list)) else [x, ] for x in teams]
+            return teams, [[self.rating[y] for y in x] for x in teams]
 
     def ratings_team(self, *teams: str | list[str], ratings: list[list[float]]=None) -> list[float]:
         if self.is_check:
@@ -164,8 +175,7 @@ class Elo:
                 for x in ranks: assert x >= 1
                 assert len(teams) == len(ranks)
         if is_np:
-            se      = pd.Series(self.rating)
-            ratings = se[teams.reshape(-1)].values.reshape(teams.shape)
+            _, ratings = self.ratings(teams)
             if structure is not None:
                 structure = [0, ] + structure + [teams.shape[-1], ]
                 ratings   = [ratings[:, structure[i]:structure[i+1]].sum(axis=-1) for i in range(len(structure) - 1)]
