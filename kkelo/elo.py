@@ -1,5 +1,4 @@
 import numpy as np
-import pandas as pd
 from .util import check_type_list, evaluate_ndcg
 
 
@@ -72,12 +71,11 @@ class Elo:
         if self.is_check:
             if is_np:
                 assert len(teams.shape) in [1, 2]
-                assert np.issubdtype(teams.dtype, np.str_)
+                assert np.issubdtype(teams.dtype, np.str_) or teams.dtype in [np.object_]
             else:
                 assert check_type_list(teams, [list, str], str)
         if is_np:
-            se      = pd.Series(self.rating)
-            ratings = se[teams.reshape(-1)].values.reshape(teams.shape)
+            ratings = np.array([self.rating[x] for x in teams.reshape(-1)]).reshape(teams.shape)
             return None, ratings
         else:
             teams = [x if isinstance(x, (tuple, list)) else [x, ] for x in teams]
@@ -162,7 +160,7 @@ class Elo:
                 assert len(teams.shape) == len(ranks.shape) == 2
                 assert teams.shape[0] == ranks.shape[0]
                 assert ranks.dtype in [int, np.int32, np.int64]
-                assert np.issubdtype(teams.dtype, np.str_)
+                assert np.issubdtype(teams.dtype, np.str_) or teams.dtype in [np.object_]
                 if structure is None:
                     assert teams.shape == ranks.shape
                 else:
