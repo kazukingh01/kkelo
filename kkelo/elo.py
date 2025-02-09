@@ -66,25 +66,32 @@ class NumpyDict:
             if self.is_check:
                 assert isinstance(values, (list, np.ndarray))
                 assert len(keys) == len(values)
-            keys   = np.array(keys, dtype=object)
-            values = np.array(values, dtype=self.dtype)
-            boolwk = [x in self.sets for x in keys]
-            if np.any(boolwk):
+            if len(self.keys) == 0:
                 if self.is_series:
-                    self.values[self.keys[keys[boolwk]]] = values[boolwk]
+                    self.keys = pd.Series({x: i for i, x in enumerate(keys)})
                 else:
-                    self.values[[self.keys[x] for x in keys[boolwk]]] = values[boolwk]
-                boolwk = [not x for x in boolwk]
-                keys   = keys[  boolwk]
-                values = values[boolwk]
-            if keys.shape[0] > 0:
-                new_idxs  = np.arange(len(self.keys), len(self.keys) + keys.shape[0], dtype=int)
-                if self.is_series:
-                    self.keys = pd.concat([self.keys, pd.Series({x: int(y) for x, y in zip(keys, new_idxs)})])
-                else:
-                    self.keys = self.keys | {x: int(y) for x, y in zip(keys, new_idxs)}
-                self.values[new_idxs] = values
-                self.sets.update(keys.tolist())
+                    self.keys = {x: i for i, x in enumerate(keys)}
+                self.values[np.arange(len(keys), dtype=int)] = values
+            else:
+                keys   = np.array(keys, dtype=object)
+                values = np.array(values, dtype=self.dtype)
+                boolwk = [x in self.sets for x in keys]
+                if np.any(boolwk):
+                    if self.is_series:
+                        self.values[self.keys[keys[boolwk]]] = values[boolwk]
+                    else:
+                        self.values[[self.keys[x] for x in keys[boolwk]]] = values[boolwk]
+                    boolwk = [not x for x in boolwk]
+                    keys   = keys[  boolwk]
+                    values = values[boolwk]
+                if keys.shape[0] > 0:
+                    new_idxs  = np.arange(len(self.keys), len(self.keys) + keys.shape[0], dtype=int)
+                    if self.is_series:
+                        self.keys = pd.concat([self.keys, pd.Series({x: int(y) for x, y in zip(keys, new_idxs)})])
+                    else:
+                        self.keys = self.keys | {x: int(y) for x, y in zip(keys, new_idxs)}
+                    self.values[new_idxs] = values
+                    self.sets.update(keys.tolist())
         else:
             if self.is_check:
                 assert isinstance(values, self.dtype)
@@ -97,6 +104,13 @@ class NumpyDict:
                     self.values = np.concatenate([self.values, np.zeros(self.default_size, dtype=self.dtype)])
                 self.values[n_keys] = values
                 self.sets.add(keys)
+    def to_dict(self) -> dict:
+        return {x: self.values[y] for x, y in self.keys.items()}
+    def to_pandas(self) -> pd.DataFrame:
+        df = pd.DataFrame(list(self.keys.items()), columns=["keys", "values"])
+        df["values"] = self.values[df["values"].to_numpy(dtype=int)]
+        return df
+
 
 class Elo:
     def __init__(self, init_rating: int | float=500, diff: int=400, k: int=10, n_round: int=3, is_check: bool=True, dtype=np.float32):
@@ -141,19 +155,27 @@ class Elo:
         self.is_check    = is_check
         self.dtype       = dtype
     
-    def add_players(self, name: str | list[str], rating: float | list[float]=None):
+    def add_players(self, name: str | list[str] | np.ndarray[str], rating: float | list[float] | np.ndarray=None):
         if isinstance(name, str): name = [name,]
         if self.is_check:
-            assert check_type_list(name, str)
-        if rating is None:
-            rating = [self.init_rating] * len(name)
-        else:
-            if isinstance(rating, (list, tuple)):
-                assert len(rating) == len(name)
+            if isinstance(name, np.ndarray):
+                assert len(name.shape) == 1
+                assert name.dtype == object
             else:
-                rating = [rating] * len(name)
+                assert check_type_list(name, str)
+        if rating is None:
+            rating = np.ones(len(name), dtype=self.dtype) * self.init_rating
+        else:
+            if isinstance(rating, (list, tuple, np.ndarray)):
+                rating = np.array(rating, dtype=self.dtype)
+            else:
+                rating = np.ones(len(name), dtype=self.dtype) * rating
         if self.is_check:
-            assert check_type_list(rating, [int, float, self.dtype])
+            assert len(rating) == len(name)
+            if isinstance(rating, np.ndarray):
+                assert rating.dtype == self.dtype
+            else:
+                assert check_type_list(rating, [int, float, self.dtype])
         self.rating.update(name, rating)
 
     def ratings(self, *teams: str | list[str] | np.ndarray) -> tuple[None | list[list[str]], np.ndarray | list[list[float]]]:

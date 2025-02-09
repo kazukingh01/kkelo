@@ -56,3 +56,6 @@ ndfpl3 = ndfwk3.tolist()
 a = time.time(); b = np.vectorize(elo1.rating.keys.get)(ndfwk3); print(time.time() - a)
 a = time.time(); b = np.array([elo1.rating.keys.get(x) for x in ndfwk3.reshape(-1)]).reshape(ndfwk3.shape); print(time.time() - a)
 a = time.time(); b = [[elo1.rating.keys.get(y) for y in x] for x in ndfpl3];  print(time.time() - a)
+
+a = elo1.rating.to_pandas()
+b = elo1.rating.to_dict()
