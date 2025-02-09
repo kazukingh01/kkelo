@@ -1,4 +1,5 @@
 import numpy as np
+import pandas as pd
 from .util import check_type_list, evaluate_ndcg
 
 
@@ -8,8 +9,97 @@ __all__ = [
 ]
 
 
+class NumpyDict:
+    def __init__(self, is_check: bool=True, dtype=float, default_size: int=1000, is_series: bool=False):
+        assert isinstance(is_check, bool)
+        assert isinstance(default_size, int) and default_size > 0
+        self.is_check     = is_check
+        self.is_series    = is_series
+        self.keys         = pd.Series(dtype=int) if is_series else {}
+        self.sets         = set()
+        self.values       = np.zeros(default_size, dtype=dtype)
+        self.dtype        = dtype
+        self.default_size = default_size
+    def __str__(self) -> str:
+        return f"{__class__.__name__}({self.values.__str__()})"
+    def __repr__(self) -> str:
+        return f"{__class__.__name__}({self.values.__repr__()})"
+    def __getitem__(self, idx: object | list[object] | np.ndarray[object]):
+        if isinstance(idx, list):
+            if self.is_series:
+                return self.values[self.keys[idx]]
+            else:
+                return self.values[[self.keys[x] for x in idx]]
+        elif isinstance(idx, np.ndarray):
+            if self.is_check:
+                assert len(idx.shape) in [1, 2]
+            if self.is_series:
+                return self.values[self.keys[idx.reshape(-1)]].reshape(idx.shape)
+            else:
+                if len(idx.shape) == 1:
+                    return self.values[[self.keys[x] for x in idx]]
+                else:
+                    return self.values[np.array([self.keys[x] for x in idx.reshape(-1)]).reshape(idx.shape)]
+        else:
+            return self.values[self.keys[idx]]
+    def __setitem__(self, keys: object | list[object] | np.ndarray, values: object | list | np.ndarray):
+        if isinstance(keys, (list, np.ndarray)):
+            if self.is_check:
+                assert isinstance(values, (list, np.ndarray))
+                assert len(keys) == len(values)
+                assert not isinstance(values[0], (list, np.ndarray))
+            if self.is_series:
+                self.values[self.keys[keys]] = values
+            else:
+                self.values[[self.keys[x] for x in keys]] = values
+        else:
+            if self.is_check:
+                assert isinstance(values, self.dtype)
+            self.values[self.keys[keys]] = values
+    def __len__(self):
+        return len(self.keys)
+    def update(self, keys: object | list[object] | np.ndarray, values: object | list | np.ndarray):
+        """
+        If you want to add new key, use this.
+        """
+        if isinstance(keys, (list, np.ndarray)):
+            if self.is_check:
+                assert isinstance(values, (list, np.ndarray))
+                assert len(keys) == len(values)
+            keys   = np.array(keys, dtype=object)
+            values = np.array(values, dtype=self.dtype)
+            boolwk = [x in self.sets for x in keys]
+            if np.any(boolwk):
+                if self.is_series:
+                    self.values[self.keys[keys[boolwk]]] = values[boolwk]
+                else:
+                    self.values[[self.keys[x] for x in keys[boolwk]]] = values[boolwk]
+                boolwk = [not x for x in boolwk]
+                keys   = keys[  boolwk]
+                values = values[boolwk]
+            if keys.shape[0] > 0:
+                new_idxs  = np.arange(len(self.keys), len(self.keys) + keys.shape[0], dtype=int)
+                if self.is_series:
+                    self.keys = pd.concat([self.keys, pd.Series({x: int(y) for x, y in zip(keys, new_idxs)})])
+                else:
+                    self.keys = self.keys | {x: int(y) for x, y in zip(keys, new_idxs)}
+                self.values[new_idxs] = values
+                self.sets.update(keys.tolist())
+        else:
+            if self.is_check:
+                assert isinstance(values, self.dtype)
+            if keys in self.sets:
+                self.values[self.keys[keys]] = values
+            else:
+                n_keys = len(self.keys)
+                self.keys[keys] = n_keys
+                if n_keys >= self.values.shape[0]:
+                    self.values = np.concatenate([self.values, np.zeros(self.default_size, dtype=self.dtype)])
+                self.values[n_keys] = values
+                self.sets.add(keys)
+
 class Elo:
-    def __init__(self, init_rating: int | float=500, diff: int=400, k: int=10, n_round: int=3, is_check: bool=True):
+    def __init__(self, init_rating: int | float=500, diff: int=400, k: int=10, n_round: int=3, is_check: bool=True, dtype=np.float32):
         """
         Ref: https://arxiv.org/pdf/2105.14069.pdf
         experience::
@@ -43,16 +133,18 @@ class Elo:
         assert isinstance(diff,    int) and diff    > 0
         assert isinstance(k,       int) and k       > 0
         assert isinstance(n_round, int) and n_round >= 0
-        self.rating      = {}
-        self.init_rating = float(init_rating)
+        self.rating      = NumpyDict(is_check=False, dtype=dtype, default_size=1000000, is_series=False)
+        self.init_rating = dtype(init_rating)
         self.diff        = diff
         self.k           = k
         self.n_round     = n_round
         self.is_check    = is_check
+        self.dtype       = dtype
     
     def add_players(self, name: str | list[str], rating: float | list[float]=None):
         if isinstance(name, str): name = [name,]
-        assert check_type_list(name, str)
+        if self.is_check:
+            assert check_type_list(name, str)
         if rating is None:
             rating = [self.init_rating] * len(name)
         else:
@@ -60,10 +152,9 @@ class Elo:
                 assert len(rating) == len(name)
             else:
                 rating = [rating] * len(name)
-            assert check_type_list(rating, [int, float])
-        for x, y in zip(name, rating):
-            if x not in self.rating:
-                self.rating[x] = float(y)
+        if self.is_check:
+            assert check_type_list(rating, [int, float, self.dtype])
+        self.rating.update(name, rating)
 
     def ratings(self, *teams: str | list[str] | np.ndarray) -> tuple[None | list[list[str]], np.ndarray | list[list[float]]]:
         is_np = (len(teams) == 1 and isinstance(teams[0], np.ndarray))
@@ -71,36 +162,35 @@ class Elo:
         if self.is_check:
             if is_np:
                 assert len(teams.shape) in [1, 2]
-                assert np.issubdtype(teams.dtype, np.str_) or teams.dtype in [np.object_]
+                assert teams.dtype in [np.object_] # np.str_ access is slower than pure str. remove condition of np.issubdtype(teams.dtype, )
             else:
                 assert check_type_list(teams, [list, str], str)
         if is_np:
-            ratings = np.array([self.rating[x] for x in teams.reshape(-1)]).reshape(teams.shape)
+            ratings = self.rating[teams]
             return None, ratings
         else:
-            teams = [x if isinstance(x, (tuple, list)) else [x, ] for x in teams]
-            return teams, [[self.rating[y] for y in x] for x in teams]
+            teams = [x if isinstance(x, (list, tuple)) else [x, ] for x in teams]
+            return teams, [self.rating[x] for x in teams]
 
-    def ratings_team(self, *teams: str | list[str], ratings: list[list[float]]=None) -> list[float]:
+    def ratings_team(self, *teams: str | list[str], ratings: list[np.ndarray]=None) -> np.ndarray:
         if self.is_check:
             assert check_type_list(teams, [list, str], str)
         if ratings is None:
             _, ratings = self.ratings(*teams)
         if self.is_check:
-            assert check_type_list(ratings, list, float)
-        return [sum(x) for x in ratings]
+            assert check_type_list(ratings, np.ndarray)
+        return np.array([x.sum() for x in ratings], dtype=self.dtype)
 
-    def weights_team(self, *teams: str | list[str], ratings: list[list[float]]=None) -> list[list[float]]:
+    def weights_team(self, *teams: str | list[str], ratings: list[np.ndarray]=None) -> list[np.ndarray]:
         if self.is_check:
             assert check_type_list(teams, list, str)
         if ratings is None:
             _, ratings = self.ratings(*teams)
         if self.is_check:
-            assert check_type_list(ratings, list, float)
-        weights = [sum(x) for x in ratings]
-        return [[z / y for z in x] for x, y in zip(ratings, weights)]
+            assert check_type_list(ratings, np.ndarray)
+        return [x / x.sum() for x in ratings]
     
-    def probability(self, *teams: str | list[str], ratings_team: list[float]=None, diff: int=None) -> np.ndarray:
+    def probability(self, *teams: str | list[str], ratings_team: np.ndarray=None, diff: int=None) -> np.ndarray:
         if self.is_check:
             assert check_type_list(teams, list, str)
         if ratings_team is None:
@@ -108,21 +198,19 @@ class Elo:
         if diff is None:
             diff = self.diff
         if self.is_check:
-            assert check_type_list(ratings_team, float)
+            assert isinstance(ratings_team, np.ndarray)
             assert isinstance(diff, int) and diff > 0
-        n_teams      = len(ratings_team)
-        ratings_team = np.array(ratings_team)
-        n_pairwise   = (n_teams * (n_teams - 1) / 2)
+        n_teams    = len(ratings_team)
+        n_pairwise = (n_teams * (n_teams - 1) / 2)
         return ((1 / (np.exp((np.tile(ratings_team, (n_teams, 1)) - ratings_team.reshape(-1, 1)) / diff) + 1)).sum(axis=-1) - 0.5) / n_pairwise # The 0.5 is introduced to cancel out (or offset) the contribution from i = j.
     
-    def update(self, *teams: str | list[str], ranks: list[int]=None, diff: int=None, k: int=None, weights: np.ndarray=None, mask: list[str]=None):
+    def update(self, *teams: str | list[str], ranks: list[int]=None, diff: int=None, k: int=None, weights: np.ndarray=None, mask: list[bool]=None):
         """
         params::
             ranks: over 1. 1 means top rank.
         """
         if diff is None: diff = self.diff
         if k    is None: k    = self.k
-        if mask is None: mask = []
         if self.is_check:
             assert check_type_list(teams, [list, str], str)
             assert check_type_list(ranks, int)
@@ -130,22 +218,26 @@ class Elo:
             assert len(teams) == len(ranks)
             assert isinstance(diff, int)
             assert isinstance(k,    int)
-            assert check_type_list(mask, str)
-        ranks            = np.array(ranks)
+            assert mask is None or check_type_list(mask, bool)
+            if mask is not None:
+                assert check_type_list(teams, list, str)
+                _n = len(teams[0])
+                for x in teams: assert len(x) == _n == len(mask)
+        ranks            = np.array(ranks, dtype=int)
         n_teams          = len(teams)
         ranks_norm       = (n_teams - ranks) / (n_teams * (n_teams - 1) / 2)
         indexes, ratings = self.ratings(*teams)
         ratings_team     = self.ratings_team(ratings=ratings)
         probs            = self.probability(ratings_team=ratings_team, diff=diff)
-        ratings_team     = np.array(ratings_team)
         ratings_team_new = ratings_team + k * (ranks_norm - probs)
         if weights is None: weights = self.weights_team(ratings=ratings)
-        else:               weights = [[weights], ] * n_teams
-        ratings_new      = [[y + z * x for y, z in zip(ratings[i], weights[i])] for i, x in enumerate(ratings_team_new - ratings_team)]
-        for x, y in zip(indexes, ratings_new):
-            for a, b in zip(x, y):
-                if a in mask: continue
-                self.rating[a] = round(b, self.n_round)
+        else:               weights = [weights, ] * n_teams
+        ratings_new      = [ratings[i] + weights[i] * x for i, x in enumerate(ratings_team_new - ratings_team)]
+        indexes, ratings_new = np.concatenate(indexes, dtype=object), np.concatenate(ratings_new, dtype=self.dtype)
+        if mask is not None:
+            mask = np.tile(mask, n_teams)
+            indexes, ratings_new = indexes[mask], ratings_new[mask]
+        self.rating[indexes] = np.round(ratings_new, decimals=self.n_round)
 
     def evaluate(self, *teams: str | list[str] | np.ndarray, ranks: list[int] | np.ndarray=None, structure: list[int]=None):
         """
@@ -180,6 +272,5 @@ class Elo:
                 ratings   = np.stack(ratings).T
         else:
             ratings = self.ratings_team(*teams)
-            ratings = np.array(ratings)
         ranks_pred = np.argsort(np.argsort(-ratings, axis=-1), axis=-1) + 1
-        return evaluate_ndcg(ranks_pred, np.array(ranks))
+        return evaluate_ndcg(ranks_pred, np.array(ranks, dtype=int))

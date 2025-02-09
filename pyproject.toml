@@ -5,6 +5,7 @@ requires-python = ">= 3.12"
 description = "Team-based Elo rating"
 dependencies = [
     'numpy>=2.2',
+    'pandas>=2.2',
 ]
 
 [build-system]

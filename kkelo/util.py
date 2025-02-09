@@ -39,7 +39,7 @@ def check_type_list(instances: list[object], _type: object | list[object], *args
         >>> check_type_list([1,2,3,[4,5,6.0]], int, [int,float])
         True
     """
-    if isinstance(instances, list) or isinstance(instances, tuple):
+    if isinstance(instances, (list, tuple)):
         for instance in instances:
             if len(args) > 0 and isinstance(instance, list):
                 is_check = check_type_list(instance, *args)
