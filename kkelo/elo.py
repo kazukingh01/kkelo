@@ -1,8 +1,10 @@
+from math import sqrt
 import numpy as np
 import pandas as pd
+from scipy.stats import norm
 import matplotlib.pyplot as plt
 from .com import NumpyDict
-from .util import check_type_list, evaluate_ndcg, normal_cdf, normal_pdf
+from .util import check_type_list, evaluate_ndcg, normal_cdf, normal_pdf, ppf
 
 
 __all__ = [
@@ -257,34 +259,30 @@ class Elo(BaseRating):
         super().update_common()
 
 
-MU     = 25.
-SIGMA  = MU / 3
-BETA   = SIGMA / 2
-TAU    = SIGMA / 100
-
-
 class TrueSkill(BaseRating):
     def __init__(
-        self, mu: int | float=MU, sigma: int | float=SIGMA, beta: int | float=BETA, d_factor: float=TAU,
-        n_round: int=3,dtype=np.float32, default_size: int=1000000, is_check: bool=True, monitors: list[str] = None
+        self, mu: int | float=25.0, sigma: int | float=None, beta: int | float=None, d_factor: float=None, p_draw: float=1e-3,
+        n_round: int=3, dtype=np.float64, default_size: int=1000000, is_check: bool=True, monitors: list[str] = None
     ):
         """
         https://herbrich.me/papers/trueskill.pdf
         https://uwaterloo.ca/computational-mathematics/sites/default/files/uploads/documents/justin_dastous_research_paper.pdf
         https://www.diva-portal.org/smash/get/diva2:1322103/FULLTEXT01.pdf
         """
-        assert isinstance(mu,    (float, int)) and mu > 0
-        assert isinstance(sigma, (float, int)) and sigma > 0
-        assert isinstance(beta,  (float, int)) and beta > 0
-        assert isinstance(d_factor,     float) and d_factor > 0
+        assert isinstance(mu, (float, int)) and mu > 0
+        assert sigma    is None or (isinstance(sigma, (float, int)) and sigma > 0)
+        assert beta     is None or (isinstance(beta,  (float, int)) and beta > 0)
+        assert d_factor is None or (isinstance(d_factor,     float) and d_factor > 0)
         super().__init__(dtype=dtype, default_size=(default_size, 2), n_round=n_round, is_check=is_check, monitors=monitors)
         self.mu        = dtype(mu)
-        self.sigma     = dtype(sigma)
+        self.sigma     = dtype(sigma) if sigma is not None else self.mu / 3
         self.var       = self.sigma ** 2
-        self.beta      = dtype(beta)
+        self.beta      = dtype(beta) if beta is not None else self.sigma / 2
         self.beta2     = self.beta ** 2
-        self.d_factor  = dtype(d_factor)
+        self.d_factor  = dtype(d_factor) if d_factor is not None else self.sigma / 100
         self.d_factor2 = self.d_factor ** 2
+        self.p_draw    = dtype(p_draw)
+        self._p_draw   = norm.ppf((self.p_draw + 1) / 2.) * self.beta
 
     def __str__(self):
         return f"{__class__.__name__}(mu: {self.mu}, sigma: {self.sigma}, beta: {self.beta}, dynamics factor: {self.d_factor})"
@@ -332,10 +330,13 @@ class TrueSkill(BaseRating):
             assert check_type_list(ratings, np.ndarray)
         return np.array([x[:, 0].sum() for x in ratings], dtype=self.dtype)
 
-    def update(self, *teams: str | list[str], ranks: list[int]=None, mask: list[bool]=None):
+    def update(self, *teams: str | list[str], ranks: list[int]=None, mask: list[bool]=None, is_boost: bool=True):
         """
         params::
             ranks: over 1. 1 means top rank.
+            is_boost:
+                basically, it's updating sequentially, means calc (rank1 vs rank2) and update, calc (rank2 vs rank3 with updated params) and update, ...
+                if is_boost is True, calcurate correlations for updating at once, and update at once.
         """
         if self.is_check:
             assert check_type_list(teams, [list, str], str)
@@ -347,43 +348,68 @@ class TrueSkill(BaseRating):
                 assert check_type_list(teams, list, str)
                 _n = len(teams[0])
                 for x in teams: assert len(x) == _n == len(mask)
-        ranks       = np.array(ranks, dtype=int)
         indexes, ratings = self.ratings(*teams)
-        skill_mu    = [x[:, 0]                  for x in ratings]
-        skill_var   = [x[:, 1] + self.d_factor2 for x in ratings]
-        perform_mu  = skill_mu
-        perform_var = [x + self.beta2 for x in skill_var]
-        teams_mu    = np.array([x.sum() for x in perform_mu ], dtype=self.dtype)
-        teams_var   = np.array([x.sum() for x in perform_var], dtype=self.dtype)
-        idx_rank    = np.argsort(ranks)
-        idx_pair    = np.stack([idx_rank[:-1], idx_rank[1:]])
-        delta       = teams_mu[ idx_pair[0]] - teams_mu[ idx_pair[1]]
-        c2          = teams_var[idx_pair[0]] + teams_var[idx_pair[1]]
-        c           = np.sqrt(c2)
-        t           = delta / c
-        v           = normal_pdf(t) / normal_cdf(t)
-        w           = v * (v + t)
-        v_c         = v / c
-        w_c2        = w / c2
-        skill_mu_new_corr_win   = [ v_c[i] * skill_var[j] for i, j in enumerate(idx_pair[0])]
-        skill_mu_new_corr_lose  = [-v_c[i] * skill_var[j] for i, j in enumerate(idx_pair[1])]
-        skill_var_new_corr_win  = [1 - (w_c2[i] * skill_var[j]) for i, j in enumerate(idx_pair[0])]
-        skill_var_new_corr_lose = [1 - (w_c2[i] * skill_var[j]) for i, j in enumerate(idx_pair[1])]
-        skill_mu_new_corr       = (
-            [skill_mu_new_corr_win[0], ] + 
-            [x + y for x, y in zip(skill_mu_new_corr_win[1:], skill_mu_new_corr_lose[:-1])] + 
-            [skill_mu_new_corr_lose[-1], ]
-        )
-        skill_var_new_corr       = (
-            [skill_var_new_corr_win[0], ] + 
-            [x * y for x, y in zip(skill_var_new_corr_win[1:], skill_var_new_corr_lose[:-1])] + 
-            [skill_var_new_corr_lose[-1], ]
-        )
-        for i, x, y in zip(idx_rank, skill_mu_new_corr, skill_var_new_corr):
-            ndf = self.rating[indexes[i]].copy()
-            ndf[:, 0] += x
-            ndf[:, 1] *= y
-            self.rating[indexes[i]] = ndf
+        ranks     = np.array(ranks, dtype=int)
+        idx_rank  = np.argsort(ranks)
+        idx_pair  = np.stack([idx_rank[:-1], idx_rank[1:]])
+        skill_mu  = [x[:, 0]                  for x in ratings]
+        skill_var = [x[:, 1] + self.d_factor2 for x in ratings]
+        if is_boost:
+            perform_mu  = skill_mu
+            perform_var = [x + self.beta2 for x in skill_var]
+            teams_mu    = np.array([x.sum() for x in perform_mu ], dtype=self.dtype)
+            teams_var   = np.array([x.sum() for x in perform_var], dtype=self.dtype)
+            n_teams     = np.array([len(x) for x in indexes], dtype=int)
+            draw_margin = self._p_draw * np.sqrt(n_teams[idx_pair[0]] + n_teams[idx_pair[1]])
+            delta       = teams_mu[ idx_pair[0]] - teams_mu[ idx_pair[1]]
+            draw_margin[delta < 0] *= -1
+            c2          = teams_var[idx_pair[0]] + teams_var[idx_pair[1]]
+            c           = np.sqrt(c2)
+            t           = (delta - draw_margin) / c
+            v           = normal_pdf(t) / normal_cdf(t)
+            w           = v * (v + t)
+            v_c         = v / c
+            w_c2        = w / c2
+            skill_mu_new_corr_win   = [ v_c[i] * skill_var[j] for i, j in enumerate(idx_pair[0])]
+            skill_mu_new_corr_lose  = [-v_c[i] * skill_var[j] for i, j in enumerate(idx_pair[1])]
+            skill_var_new_corr_win  = [1 - (w_c2[i] * skill_var[j]) for i, j in enumerate(idx_pair[0])]
+            skill_var_new_corr_lose = [1 - (w_c2[i] * skill_var[j]) for i, j in enumerate(idx_pair[1])]
+            skill_mu_new_corr       = (
+                [skill_mu_new_corr_win[0], ] + 
+                [x + y for x, y in zip(skill_mu_new_corr_win[1:], skill_mu_new_corr_lose[:-1])] + 
+                [skill_mu_new_corr_lose[-1], ]
+            )
+            skill_var_new_corr       = (
+                [skill_var_new_corr_win[0], ] + 
+                [x * y for x, y in zip(skill_var_new_corr_win[1:], skill_var_new_corr_lose[:-1])] + 
+                [skill_var_new_corr_lose[-1], ]
+            )
+            for i, x, y in zip(idx_rank, skill_mu_new_corr, skill_var_new_corr):
+                ndf = self.rating[indexes[i]].copy()
+                ndf[:, 0] += x
+                ndf[:, 1]  = (ndf[:, 1] + self.d_factor2) * y
+                self.rating[indexes[i]] = ndf
+        else:
+            for i_win, j_lose in idx_pair.T:
+                skill_var_i,   skill_var_j   = skill_var[i_win], skill_var[j_lose]
+                perform_mu_i,  perform_mu_j  = skill_mu[i_win], skill_mu[j_lose] 
+                perform_var_i, perform_var_j = (skill_var_i + self.beta2), (skill_var_j + self.beta2)
+                teams_mu_i,    teams_mu_j    = perform_mu_i.sum(),  perform_mu_j.sum()
+                teams_var_i,   teams_var_j   = perform_var_i.sum(), perform_var_j.sum()
+                delta       = teams_mu_i  - teams_mu_j
+                c2          = teams_var_i + teams_var_j
+                c           = sqrt(c2)
+                t           = delta / c
+                v           = norm.pdf(t) / norm.cdf(t)
+                w           = v * (v + t)
+                v_c         = v / c
+                w_c2        = w / c2
+                skill_mu[i_win  ] = perform_mu_i + (v_c * skill_var_i)
+                skill_mu[j_lose ] = perform_mu_j - (v_c * skill_var_j)
+                skill_var[i_win ] = skill_var_i * (1 - (w_c2 * skill_var_i))
+                skill_var[j_lose] = skill_var_j * (1 - (w_c2 * skill_var_j))
+            for idx, x, y in zip(indexes, skill_mu, skill_var):
+                self.rating[idx] = np.stack([x, y]).T
         super().update_common()
 
     def evaluate(self, *teams: str | list[str] | np.ndarray, ranks: list[int] | np.ndarray=None, structure: list[int]=None):
