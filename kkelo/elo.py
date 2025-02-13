@@ -1,119 +1,130 @@
 import numpy as np
 import pandas as pd
-from .util import check_type_list, evaluate_ndcg
+import matplotlib.pyplot as plt
+from .com import NumpyDict
+from .util import check_type_list, evaluate_ndcg, normal_cdf, normal_pdf
 
 
 __all__ = [
     "Elo",
+    "TrueSkill",
     "evaluate_ndcg",
 ]
 
 
-class NumpyDict:
-    def __init__(self, is_check: bool=True, dtype=float, default_size: int=1000, is_series: bool=False):
+class BaseRating:
+    def __init__(self, dtype=np.float32, default_size: int=1000000, n_round: int=3, is_check: bool=True, monitors: list[str] = None):
         assert isinstance(is_check, bool)
-        assert isinstance(default_size, int) and default_size > 0
-        self.is_check     = is_check
-        self.is_series    = is_series
-        self.keys         = pd.Series(dtype=int) if is_series else {}
-        self.sets         = set()
-        self.values       = np.zeros(default_size, dtype=dtype)
-        self.dtype        = dtype
-        self.default_size = default_size
-    def __str__(self) -> str:
-        return f"{__class__.__name__}({self.values.__str__()})"
-    def __repr__(self) -> str:
-        return f"{__class__.__name__}({self.values.__repr__()})"
-    def __getitem__(self, idx: object | list[object] | np.ndarray[object]):
-        if isinstance(idx, list):
-            if self.is_series:
-                return self.values[self.keys[idx]]
+        assert monitors is None or (isinstance(monitors, list) and check_type_list(monitors, str))
+        assert isinstance(n_round, int) and n_round >= 0
+        self.i_step   = 0
+        self.is_check = is_check
+        self.monitors = monitors
+        self.rating   = NumpyDict(is_check=False, dtype=dtype, default_size=default_size, is_series=False)
+        self.dtype    = dtype
+        self.n_round  = n_round
+        self.idx_mtrs:  list[int]  = []
+        self.list_mtrs: list[dict] = []    
+    def add_players(self):
+        raise NotImplementedError()
+    def ratings(self, *teams: str | list[str] | np.ndarray, idx_ret: int=None) -> tuple[None | list[list[str]], np.ndarray | list[list[float]]]:
+        is_np = (len(teams) == 1 and isinstance(teams[0], np.ndarray))
+        if is_np: teams = teams[0]
+        if self.is_check:
+            assert idx_ret is None or (isinstance(idx_ret, int) and idx_ret in [-2, -1, 0, 1])
+            if is_np:
+                assert len(teams.shape) in [1, 2]
+                assert teams.dtype in [np.object_] # np.str_ access is slower than pure str. remove condition of np.issubdtype(teams.dtype, )
             else:
-                return self.values[[self.keys[x] for x in idx]]
-        elif isinstance(idx, np.ndarray):
-            if self.is_check:
-                assert len(idx.shape) in [1, 2]
-            if self.is_series:
-                return self.values[self.keys[idx.reshape(-1)]].reshape(idx.shape)
+                assert check_type_list(teams, [list, str], str)
+        if is_np:
+            ratings = self.rating[teams]
+            if idx_ret is None:
+                return None, ratings
             else:
-                if len(idx.shape) == 1:
-                    return self.values[[self.keys[x] for x in idx]]
-                else:
-                    return self.values[np.array([self.keys[x] for x in idx.reshape(-1)]).reshape(idx.shape)]
+                return None, ratings[..., idx_ret]
         else:
-            return self.values[self.keys[idx]]
-    def __setitem__(self, keys: object | list[object] | np.ndarray, values: object | list | np.ndarray):
-        if isinstance(keys, (list, np.ndarray)):
-            if self.is_check:
-                assert isinstance(values, (list, np.ndarray))
-                assert len(keys) == len(values)
-                assert not isinstance(values[0], (list, np.ndarray))
-            if self.is_series:
-                self.values[self.keys[keys]] = values
+            teams = [x if isinstance(x, (list, tuple)) else [x, ] for x in teams]
+            if idx_ret is None:
+                return teams, [self.rating[x] for x in teams]
             else:
-                self.values[[self.keys[x] for x in keys]] = values
-        else:
-            if self.is_check:
-                assert isinstance(values, self.dtype)
-            self.values[self.keys[keys]] = values
-    def __len__(self):
-        return len(self.keys)
-    def update(self, keys: object | list[object] | np.ndarray, values: object | list | np.ndarray):
+                return teams, [self.rating[x][..., idx_ret] for x in teams]
+    def __repr__(self):
+        return self.__str__()
+    def ratings_team(self):
+        raise NotImplementedError()
+    def update(self):
+        raise NotImplementedError()
+    def update_common(self):
+        self.i_step += 1
+        if self.monitors is not None and self.i_step % 100 == 0:
+            self.list_mtrs.append({x: self.rating.values[y].copy() if self.rating.is_multi_dim else self.rating.values[y] for x, y in zip(self.monitors, self.idx_mtrs)})
+    def evaluate(self, *teams: str | list[str] | np.ndarray, ranks: list[int] | np.ndarray=None, structure: list[int]=None, idx_ret: int=None):
         """
-        If you want to add new key, use this.
+        If you want to evalate many data, you have to use np.ndarray form.
         """
-        if isinstance(keys, (list, np.ndarray)):
-            if self.is_check:
-                assert isinstance(values, (list, np.ndarray))
-                assert len(keys) == len(values)
-            if len(self.keys) == 0:
-                if self.is_series:
-                    self.keys = pd.Series({x: i for i, x in enumerate(keys)})
+        is_np = (len(teams) == 1 and isinstance(teams[0], np.ndarray))
+        if is_np: teams = teams[0]
+        if self.is_check:
+            assert ranks is not None
+            if is_np:
+                assert isinstance(ranks, np.ndarray)
+                assert len(teams.shape) == len(ranks.shape) == 2
+                assert teams.shape[0] == ranks.shape[0]
+                assert ranks.dtype in [int, np.int32, np.int64]
+                assert np.issubdtype(teams.dtype, np.str_) or teams.dtype in [np.object_]
+                if structure is None:
+                    assert teams.shape == ranks.shape
                 else:
-                    self.keys = {x: i for i, x in enumerate(keys)}
-                self.values[np.arange(len(keys), dtype=int)] = values
+                    assert (len(structure) + 1) == ranks.shape[-1]
+                    assert check_type_list(structure, int)
             else:
-                keys   = np.array(keys, dtype=object)
-                values = np.array(values, dtype=self.dtype)
-                boolwk = [x in self.sets for x in keys]
-                if np.any(boolwk):
-                    if self.is_series:
-                        self.values[self.keys[keys[boolwk]]] = values[boolwk]
-                    else:
-                        self.values[[self.keys[x] for x in keys[boolwk]]] = values[boolwk]
-                    boolwk = [not x for x in boolwk]
-                    keys   = keys[  boolwk]
-                    values = values[boolwk]
-                if keys.shape[0] > 0:
-                    new_idxs  = np.arange(len(self.keys), len(self.keys) + keys.shape[0], dtype=int)
-                    if self.is_series:
-                        self.keys = pd.concat([self.keys, pd.Series({x: int(y) for x, y in zip(keys, new_idxs)})])
-                    else:
-                        self.keys = self.keys | {x: int(y) for x, y in zip(keys, new_idxs)}
-                    self.values[new_idxs] = values
-                    self.sets.update(keys.tolist())
+                assert check_type_list(teams, [list, str], str)
+                assert isinstance(ranks, (tuple, list))
+                assert check_type_list(ranks, int)
+                for x in ranks: assert x >= 1
+                assert len(teams) == len(ranks)
+        if is_np:
+            _, ratings = self.ratings(teams, idx_ret=idx_ret)
+            if structure is not None:
+                structure = [0, ] + structure + [teams.shape[-1], ]
+                ratings   = [ratings[:, structure[i]:structure[i+1]].sum(axis=-1) for i in range(len(structure) - 1)]
+                ratings   = np.stack(ratings).T
         else:
-            if self.is_check:
-                assert isinstance(values, self.dtype)
-            if keys in self.sets:
-                self.values[self.keys[keys]] = values
+            ratings = self.ratings_team(*teams)
+        ranks_pred = np.argsort(np.argsort(-ratings, axis=-1), axis=-1) + 1
+        return evaluate_ndcg(ranks_pred, np.array(ranks, dtype=int))
+    def monitors_to_pandas(self):
+        if self.monitors is not None:
+            return pd.DataFrame(self.list_mtrs)
+        else:
+            raise AttributeError(f"monitors is not set.")
+    def monitors_to_plot(self, figsize: tuple[int, int]=(10, 6)):
+        if self.monitors is not None:
+            dforg = pd.DataFrame(self.list_mtrs)
+            if isinstance(dforg.iloc[0, 0], (list, np.ndarray)):
+                n_len = len(dforg.iloc[0, 0])
+                df = pd.DataFrame(index=dforg.index)
+                for x in dforg.columns:
+                    for y in range(n_len):
+                        df[f"{x}_{y}"] = dforg[x].str[y]
             else:
-                n_keys = len(self.keys)
-                self.keys[keys] = n_keys
-                if n_keys >= self.values.shape[0]:
-                    self.values = np.concatenate([self.values, np.zeros(self.default_size, dtype=self.dtype)])
-                self.values[n_keys] = values
-                self.sets.add(keys)
-    def to_dict(self) -> dict:
-        return {x: self.values[y] for x, y in self.keys.items()}
-    def to_pandas(self) -> pd.DataFrame:
-        df = pd.DataFrame(list(self.keys.items()), columns=["keys", "values"])
-        df["values"] = self.values[df["values"].to_numpy(dtype=int)]
-        return df
+                df = dforg.copy()
+            df.plot(figsize=figsize)
+            plt.xlabel('n steps ( x 100 )')
+            plt.ylabel('Rating')
+            plt.title(self.__str__())
+            plt.legend()
+            plt.show()
+        else:
+            raise AttributeError(f"monitors is not set.")
+    
 
-
-class Elo:
-    def __init__(self, init_rating: int | float=500, diff: int=400, k: int=10, n_round: int=3, is_check: bool=True, dtype=np.float32):
+class Elo(BaseRating):
+    def __init__(
+        self, init_rating: int | float=500, diff: int=400, k: int=10, n_round: int=3,
+        dtype=np.float32, default_size: int=1000000, is_check: bool=True, monitors: list[str] = None
+    ):
         """
         Ref: https://arxiv.org/pdf/2105.14069.pdf
         experience::
@@ -146,15 +157,14 @@ class Elo:
         assert isinstance(init_rating, (int, float))
         assert isinstance(diff,    int) and diff    > 0
         assert isinstance(k,       int) and k       > 0
-        assert isinstance(n_round, int) and n_round >= 0
-        self.rating      = NumpyDict(is_check=False, dtype=dtype, default_size=1000000, is_series=False)
+        super().__init__(dtype=dtype, default_size=default_size, n_round=n_round, is_check=is_check, monitors=monitors)
         self.init_rating = dtype(init_rating)
         self.diff        = diff
         self.k           = k
-        self.n_round     = n_round
-        self.is_check    = is_check
-        self.dtype       = dtype
     
+    def __str__(self):
+        return f"{__class__.__name__}(init: {self.init_rating}, diff: {self.diff}, k: {self.k})"
+
     def add_players(self, name: str | list[str] | np.ndarray[str], rating: float | list[float] | np.ndarray=None):
         if isinstance(name, str): name = [name,]
         if self.is_check:
@@ -172,27 +182,11 @@ class Elo:
                 rating = np.ones(len(name), dtype=self.dtype) * rating
         if self.is_check:
             assert len(rating) == len(name)
-            if isinstance(rating, np.ndarray):
-                assert rating.dtype == self.dtype
-            else:
-                assert check_type_list(rating, [int, float, self.dtype])
+            assert isinstance(rating, np.ndarray)
+            assert rating.dtype == self.dtype
         self.rating.update(name, rating)
-
-    def ratings(self, *teams: str | list[str] | np.ndarray) -> tuple[None | list[list[str]], np.ndarray | list[list[float]]]:
-        is_np = (len(teams) == 1 and isinstance(teams[0], np.ndarray))
-        if is_np: teams = teams[0]
-        if self.is_check:
-            if is_np:
-                assert len(teams.shape) in [1, 2]
-                assert teams.dtype in [np.object_] # np.str_ access is slower than pure str. remove condition of np.issubdtype(teams.dtype, )
-            else:
-                assert check_type_list(teams, [list, str], str)
-        if is_np:
-            ratings = self.rating[teams]
-            return None, ratings
-        else:
-            teams = [x if isinstance(x, (list, tuple)) else [x, ] for x in teams]
-            return teams, [self.rating[x] for x in teams]
+        if self.monitors is not None:
+            self.idx_mtrs = [self.rating.keys[x] for x in self.monitors]
 
     def ratings_team(self, *teams: str | list[str], ratings: list[np.ndarray]=None) -> np.ndarray:
         if self.is_check:
@@ -260,39 +254,137 @@ class Elo:
             mask = np.tile(mask, n_teams)
             indexes, ratings_new = indexes[mask], ratings_new[mask]
         self.rating[indexes] = np.round(ratings_new, decimals=self.n_round)
+        super().update_common()
+
+
+MU     = 25.
+SIGMA  = MU / 3
+BETA   = SIGMA / 2
+TAU    = SIGMA / 100
+
+
+class TrueSkill(BaseRating):
+    def __init__(
+        self, mu: int | float=MU, sigma: int | float=SIGMA, beta: int | float=BETA, d_factor: float=TAU,
+        n_round: int=3,dtype=np.float32, default_size: int=1000000, is_check: bool=True, monitors: list[str] = None
+    ):
+        """
+        https://herbrich.me/papers/trueskill.pdf
+        https://uwaterloo.ca/computational-mathematics/sites/default/files/uploads/documents/justin_dastous_research_paper.pdf
+        https://www.diva-portal.org/smash/get/diva2:1322103/FULLTEXT01.pdf
+        """
+        assert isinstance(mu,    (float, int)) and mu > 0
+        assert isinstance(sigma, (float, int)) and sigma > 0
+        assert isinstance(beta,  (float, int)) and beta > 0
+        assert isinstance(d_factor,     float) and d_factor > 0
+        super().__init__(dtype=dtype, default_size=(default_size, 2), n_round=n_round, is_check=is_check, monitors=monitors)
+        self.mu        = dtype(mu)
+        self.sigma     = dtype(sigma)
+        self.var       = self.sigma ** 2
+        self.beta      = dtype(beta)
+        self.beta2     = self.beta ** 2
+        self.d_factor  = dtype(d_factor)
+        self.d_factor2 = self.d_factor ** 2
+
+    def __str__(self):
+        return f"{__class__.__name__}(mu: {self.mu}, sigma: {self.sigma}, beta: {self.beta}, dynamics factor: {self.d_factor})"
+
+    def add_players(self, name: str | list[str] | np.ndarray[str], mu: float | list[float] | np.ndarray=None, sigma: float | list[float] | np.ndarray=None):
+        if isinstance(name, str): name = [name,]
+        if self.is_check:
+            if isinstance(name, np.ndarray):
+                assert len(name.shape) == 1
+                assert name.dtype == object
+            else:
+                assert check_type_list(name, str)
+        if mu is None:
+            assert sigma is None
+            rating = np.ones((len(name), 2), dtype=self.dtype)
+            rating[:, 0] = self.mu
+            rating[:, 1] = self.var
+        else:
+            if isinstance(mu, (list, tuple, np.ndarray)):
+                if self.is_check:
+                    assert type(mu) == type(sigma)
+                    assert len(mu)  == len(sigma)
+                rating = np.stack([
+                    np.array(mu, dtype=self.dtype),
+                    np.array(sigma ** 2, dtype=self.dtype)
+                ], dtype=self.dtype).T
+            else:
+                rating = np.ones((len(name), 2), dtype=self.dtype)
+                rating[:, 0] = self.dtype(mu)
+                rating[:, 1] = self.dtype(sigma ** 2)
+        if self.is_check:
+            assert len(rating) == len(name)
+            assert isinstance(rating, np.ndarray)
+            assert rating.dtype == self.dtype
+        self.rating.update(name, rating)
+        if self.monitors is not None:
+            self.idx_mtrs = [self.rating.keys[x] for x in self.monitors]
+
+    def ratings_team(self, *teams: str | list[str], ratings: list[np.ndarray]=None) -> np.ndarray:
+        if self.is_check:
+            assert check_type_list(teams, [list, str], str)
+        if ratings is None:
+            _, ratings = self.ratings(*teams)
+        if self.is_check:
+            assert check_type_list(ratings, np.ndarray)
+        return np.array([x[:, 0].sum() for x in ratings], dtype=self.dtype)
+
+    def update(self, *teams: str | list[str], ranks: list[int]=None, mask: list[bool]=None):
+        """
+        params::
+            ranks: over 1. 1 means top rank.
+        """
+        if self.is_check:
+            assert check_type_list(teams, [list, str], str)
+            assert check_type_list(ranks, int)
+            for x in ranks: assert x >= 1
+            assert len(teams) == len(ranks)
+            assert mask is None or check_type_list(mask, bool)
+            if mask is not None:
+                assert check_type_list(teams, list, str)
+                _n = len(teams[0])
+                for x in teams: assert len(x) == _n == len(mask)
+        ranks       = np.array(ranks, dtype=int)
+        indexes, ratings = self.ratings(*teams)
+        skill_mu    = [x[:, 0]                  for x in ratings]
+        skill_var   = [x[:, 1] + self.d_factor2 for x in ratings]
+        perform_mu  = skill_mu
+        perform_var = [x + self.beta2 for x in skill_var]
+        teams_mu    = np.array([x.sum() for x in perform_mu ], dtype=self.dtype)
+        teams_var   = np.array([x.sum() for x in perform_var], dtype=self.dtype)
+        idx_rank    = np.argsort(ranks)
+        idx_pair    = np.stack([idx_rank[:-1], idx_rank[1:]])
+        delta       = teams_mu[ idx_pair[0]] - teams_mu[ idx_pair[1]]
+        c2          = teams_var[idx_pair[0]] + teams_var[idx_pair[1]]
+        c           = np.sqrt(c2)
+        t           = delta / c
+        v           = normal_pdf(t) / normal_cdf(t)
+        w           = v * (v + t)
+        v_c         = v / c
+        w_c2        = w / c2
+        skill_mu_new_corr_win   = [ v_c[i] * skill_var[j] for i, j in enumerate(idx_pair[0])]
+        skill_mu_new_corr_lose  = [-v_c[i] * skill_var[j] for i, j in enumerate(idx_pair[1])]
+        skill_var_new_corr_win  = [1 - (w_c2[i] * skill_var[j]) for i, j in enumerate(idx_pair[0])]
+        skill_var_new_corr_lose = [1 - (w_c2[i] * skill_var[j]) for i, j in enumerate(idx_pair[1])]
+        skill_mu_new_corr       = (
+            [skill_mu_new_corr_win[0], ] + 
+            [x + y for x, y in zip(skill_mu_new_corr_win[1:], skill_mu_new_corr_lose[:-1])] + 
+            [skill_mu_new_corr_lose[-1], ]
+        )
+        skill_var_new_corr       = (
+            [skill_var_new_corr_win[0], ] + 
+            [x * y for x, y in zip(skill_var_new_corr_win[1:], skill_var_new_corr_lose[:-1])] + 
+            [skill_var_new_corr_lose[-1], ]
+        )
+        for i, x, y in zip(idx_rank, skill_mu_new_corr, skill_var_new_corr):
+            ndf = self.rating[indexes[i]].copy()
+            ndf[:, 0] += x
+            ndf[:, 1] *= y
+            self.rating[indexes[i]] = ndf
+        super().update_common()
 
     def evaluate(self, *teams: str | list[str] | np.ndarray, ranks: list[int] | np.ndarray=None, structure: list[int]=None):
-        """
-        If you want to evalate many data, you have to use np.ndarray form.
-        """
-        is_np = (len(teams) == 1 and isinstance(teams[0], np.ndarray))
-        if is_np: teams = teams[0]
-        if self.is_check:
-            assert ranks is not None
-            if is_np:
-                assert isinstance(ranks, np.ndarray)
-                assert len(teams.shape) == len(ranks.shape) == 2
-                assert teams.shape[0] == ranks.shape[0]
-                assert ranks.dtype in [int, np.int32, np.int64]
-                assert np.issubdtype(teams.dtype, np.str_) or teams.dtype in [np.object_]
-                if structure is None:
-                    assert teams.shape == ranks.shape
-                else:
-                    assert (len(structure) + 1) == ranks.shape[-1]
-                    assert check_type_list(structure, int)
-            else:
-                assert check_type_list(teams, [list, str], str)
-                assert isinstance(ranks, (tuple, list))
-                assert check_type_list(ranks, int)
-                for x in ranks: assert x >= 1
-                assert len(teams) == len(ranks)
-        if is_np:
-            _, ratings = self.ratings(teams)
-            if structure is not None:
-                structure = [0, ] + structure + [teams.shape[-1], ]
-                ratings   = [ratings[:, structure[i]:structure[i+1]].sum(axis=-1) for i in range(len(structure) - 1)]
-                ratings   = np.stack(ratings).T
-        else:
-            ratings = self.ratings_team(*teams)
-        ranks_pred = np.argsort(np.argsort(-ratings, axis=-1), axis=-1) + 1
-        return evaluate_ndcg(ranks_pred, np.array(ranks, dtype=int))
+        return super().evaluate(*teams, ranks=ranks, structure=structure, idx_ret=0)
