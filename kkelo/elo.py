@@ -3,6 +3,8 @@ import numpy as np
 import pandas as pd
 from scipy.stats import norm
 import matplotlib.pyplot as plt
+import trueskill
+# local package
 from .com import NumpyDict
 from .util import check_type_list, evaluate_ndcg, normal_cdf, normal_pdf, ppf
 
@@ -10,6 +12,7 @@ from .util import check_type_list, evaluate_ndcg, normal_cdf, normal_pdf, ppf
 __all__ = [
     "Elo",
     "TrueSkill",
+    "TrueSkillOriginal",
     "evaluate_ndcg",
 ]
 
@@ -261,7 +264,7 @@ class Elo(BaseRating):
 
 class TrueSkill(BaseRating):
     def __init__(
-        self, mu: int | float=25.0, sigma: int | float=None, beta: int | float=None, d_factor: float=None, p_draw: float=1e-3,
+        self, mu: int | float=25.0, sigma: int | float=None, beta: int | float=None, d_factor: float=None, p_draw: float=None,
         n_round: int=3, dtype=np.float64, default_size: int=1000000, is_check: bool=True, monitors: list[str] = None
     ):
         """
@@ -273,6 +276,7 @@ class TrueSkill(BaseRating):
         assert sigma    is None or (isinstance(sigma, (float, int)) and sigma > 0)
         assert beta     is None or (isinstance(beta,  (float, int)) and beta > 0)
         assert d_factor is None or (isinstance(d_factor,     float) and d_factor > 0)
+        assert p_draw   is None or (isinstance(p_draw,       float) and p_draw   > 0)
         super().__init__(dtype=dtype, default_size=(default_size, 2), n_round=n_round, is_check=is_check, monitors=monitors)
         self.mu        = dtype(mu)
         self.sigma     = dtype(sigma) if sigma is not None else self.mu / 3
@@ -281,8 +285,9 @@ class TrueSkill(BaseRating):
         self.beta2     = self.beta ** 2
         self.d_factor  = dtype(d_factor) if d_factor is not None else self.sigma / 100
         self.d_factor2 = self.d_factor ** 2
-        self.p_draw    = dtype(p_draw)
-        self._p_draw   = norm.ppf((self.p_draw + 1) / 2.) * self.beta
+        self.p_draw    = dtype(p_draw) if p_draw is not None else p_draw
+        if self.p_draw is not None:
+            self._p_draw   = norm.ppf((self.p_draw + 1) / 2.) * self.beta
 
     def __str__(self):
         return f"{__class__.__name__}(mu: {self.mu}, sigma: {self.sigma}, beta: {self.beta}, dynamics factor: {self.d_factor})"
@@ -330,13 +335,10 @@ class TrueSkill(BaseRating):
             assert check_type_list(ratings, np.ndarray)
         return np.array([x[:, 0].sum() for x in ratings], dtype=self.dtype)
 
-    def update(self, *teams: str | list[str], ranks: list[int]=None, mask: list[bool]=None, is_boost: bool=True):
+    def update(self, *teams: str | list[str], ranks: list[int]=None, mask: list[bool]=None):
         """
         params::
             ranks: over 1. 1 means top rank.
-            is_boost:
-                basically, it's updating sequentially, means calc (rank1 vs rank2) and update, calc (rank2 vs rank3 with updated params) and update, ...
-                if is_boost is True, calcurate correlations for updating at once, and update at once.
         """
         if self.is_check:
             assert check_type_list(teams, [list, str], str)
@@ -351,66 +353,150 @@ class TrueSkill(BaseRating):
         indexes, ratings = self.ratings(*teams)
         ranks     = np.array(ranks, dtype=int)
         idx_rank  = np.argsort(ranks)
-        idx_pair  = np.stack([idx_rank[:-1], idx_rank[1:]])
+        # idx_invrs = np.argsort(idx_rank)
+        idx_pairs = np.stack([idx_rank[:-1], idx_rank[1:]])
+        i_center  = idx_pairs.shape[-1] // 2
+        list_idxs = [idx_pairs[:, [i_center]], ] + [idx_pairs[:, [i_center - i, i_center + i]] for i in np.arange(1, i_center + 1, dtype=int)]
         skill_mu  = [x[:, 0]                  for x in ratings]
         skill_var = [x[:, 1] + self.d_factor2 for x in ratings]
-        if is_boost:
-            perform_mu  = skill_mu
-            perform_var = [x + self.beta2 for x in skill_var]
-            teams_mu    = np.array([x.sum() for x in perform_mu ], dtype=self.dtype)
-            teams_var   = np.array([x.sum() for x in perform_var], dtype=self.dtype)
-            n_teams     = np.array([len(x) for x in indexes], dtype=int)
-            draw_margin = self._p_draw * np.sqrt(n_teams[idx_pair[0]] + n_teams[idx_pair[1]])
-            delta       = teams_mu[ idx_pair[0]] - teams_mu[ idx_pair[1]]
-            draw_margin[delta < 0] *= -1
-            c2          = teams_var[idx_pair[0]] + teams_var[idx_pair[1]]
-            c           = np.sqrt(c2)
-            t           = (delta - draw_margin) / c
-            v           = normal_pdf(t) / normal_cdf(t)
-            w           = v * (v + t)
-            v_c         = v / c
-            w_c2        = w / c2
-            skill_mu_new_corr_win   = [ v_c[i] * skill_var[j] for i, j in enumerate(idx_pair[0])]
-            skill_mu_new_corr_lose  = [-v_c[i] * skill_var[j] for i, j in enumerate(idx_pair[1])]
-            skill_var_new_corr_win  = [1 - (w_c2[i] * skill_var[j]) for i, j in enumerate(idx_pair[0])]
-            skill_var_new_corr_lose = [1 - (w_c2[i] * skill_var[j]) for i, j in enumerate(idx_pair[1])]
-            skill_mu_new_corr       = (
-                [skill_mu_new_corr_win[0], ] + 
-                [x + y for x, y in zip(skill_mu_new_corr_win[1:], skill_mu_new_corr_lose[:-1])] + 
-                [skill_mu_new_corr_lose[-1], ]
-            )
-            skill_var_new_corr       = (
-                [skill_var_new_corr_win[0], ] + 
-                [x * y for x, y in zip(skill_var_new_corr_win[1:], skill_var_new_corr_lose[:-1])] + 
-                [skill_var_new_corr_lose[-1], ]
-            )
-            for i, x, y in zip(idx_rank, skill_mu_new_corr, skill_var_new_corr):
-                ndf = self.rating[indexes[i]].copy()
-                ndf[:, 0] += x
-                ndf[:, 1]  = (ndf[:, 1] + self.d_factor2) * y
-                self.rating[indexes[i]] = ndf
-        else:
-            for i_win, j_lose in idx_pair.T:
-                skill_var_i,   skill_var_j   = skill_var[i_win], skill_var[j_lose]
-                perform_mu_i,  perform_mu_j  = skill_mu[i_win], skill_mu[j_lose] 
-                perform_var_i, perform_var_j = (skill_var_i + self.beta2), (skill_var_j + self.beta2)
-                teams_mu_i,    teams_mu_j    = perform_mu_i.sum(),  perform_mu_j.sum()
-                teams_var_i,   teams_var_j   = perform_var_i.sum(), perform_var_j.sum()
-                delta       = teams_mu_i  - teams_mu_j
-                c2          = teams_var_i + teams_var_j
-                c           = sqrt(c2)
-                t           = delta / c
-                v           = norm.pdf(t) / norm.cdf(t)
-                w           = v * (v + t)
-                v_c         = v / c
-                w_c2        = w / c2
-                skill_mu[i_win  ] = perform_mu_i + (v_c * skill_var_i)
-                skill_mu[j_lose ] = perform_mu_j - (v_c * skill_var_j)
-                skill_var[i_win ] = skill_var_i * (1 - (w_c2 * skill_var_i))
-                skill_var[j_lose] = skill_var_j * (1 - (w_c2 * skill_var_j))
-            for idx, x, y in zip(indexes, skill_mu, skill_var):
-                self.rating[idx] = np.stack([x, y]).T
+        # update
+        for _ in range(1):
+            for idx_pair in list_idxs: # win or lose process
+                prfrm_mu  = skill_mu
+                prfrm_var = [x + self.beta2 for x in skill_var]
+                teams_mu  = np.array([x.sum() for x in prfrm_mu ], dtype=self.dtype)
+                teams_var = np.array([x.sum() for x in prfrm_var], dtype=self.dtype)
+                delta     = teams_mu[ idx_pair[0]] - teams_mu[ idx_pair[1]] # 0 means win, 1 means lose
+                if self.p_draw is not None:
+                    n_teams     = np.array([len(x) for x in indexes], dtype=int)
+                    draw_margin = self._p_draw * np.sqrt(n_teams[idx_pair[0]] + n_teams[idx_pair[1]])
+                    draw_margin[delta < 0] *= -1
+                    delta       = delta - draw_margin
+                c2        = teams_var[idx_pair[0]] + teams_var[idx_pair[1]]
+                c         = np.sqrt(c2)
+                t         = delta / c
+                v         = normal_pdf(t) / normal_cdf(t)
+                w         = v * (v + t)
+                v_c       = v / c
+                # w_c2      = w / c2
+                weight    = [x / x.sum() for x in skill_var]
+                # teams_mu[idx_pair[0]]  = teams_mu[idx_pair[0]] + (v_c * teams_var[idx_pair[0]])
+                # teams_mu[idx_pair[1]]  = teams_mu[idx_pair[1]] - (v_c * teams_var[idx_pair[1]])
+                # teams_var[idx_pair[0]] = teams_var[idx_pair[0]] * (1 - (w_c2 * teams_var[idx_pair[0]]))
+                # teams_var[idx_pair[1]] = teams_var[idx_pair[1]] * (1 - (w_c2 * teams_var[idx_pair[1]]))
+                for i, j in enumerate(idx_pair[0]):
+                    skill_mu[j]  = skill_mu[j] + (v_c[i] * teams_var[j] * weight[j])
+                    skill_var[j] = skill_var[j] * (1 - (skill_var[j] * w[i] / c2[i]))
+                for i, j in enumerate(idx_pair[1]):
+                    skill_mu[j]  = skill_mu[j] - (v_c[i] * teams_var[j] * skill_var[j] / skill_var[j].sum())
+                    skill_var[j] = skill_var[j] * (1 - (skill_var[j] * w[i] / c2[i]))
+        for i, x, y in zip(indexes, skill_mu, skill_var):
+            self.rating[i] = np.stack([x, y]).T
         super().update_common()
 
     def evaluate(self, *teams: str | list[str] | np.ndarray, ranks: list[int] | np.ndarray=None, structure: list[int]=None):
         return super().evaluate(*teams, ranks=ranks, structure=structure, idx_ret=0)
+
+
+class TrueSkillOriginal:
+    def __init__(
+        self, mu: int | float=25.0, sigma: int | float=None, beta: int | float=None, d_factor: float=None, p_draw: float=None,
+        min_delta: float=10, is_check: bool=True, monitors: list[str] = None
+    ):
+        assert isinstance(mu, (float, int)) and mu > 0
+        assert sigma    is None or (isinstance(sigma, (float, int)) and sigma > 0)
+        assert beta     is None or (isinstance(beta,  (float, int)) and beta > 0)
+        assert d_factor is None or (isinstance(d_factor,     float) and d_factor > 0)
+        assert p_draw   is None or (isinstance(p_draw,       float) and p_draw   > 0)
+        assert isinstance(min_delta, (int, float)) and min_delta > 0
+        assert isinstance(is_check, bool)
+        assert monitors is None or (isinstance(monitors, list) and check_type_list(monitors, str))
+        sigma          = sigma    if sigma    is not None else mu / 3.
+        beta           = beta     if beta     is not None else sigma / 2.
+        d_factor       = d_factor if d_factor is not None else sigma / 100.
+        p_draw         = p_draw   if p_draw   is not None else 0.0
+        self.env       = trueskill.TrueSkill(mu=mu, sigma=sigma, beta=beta, tau=d_factor, draw_probability=p_draw, backend=None)
+        self.rating    = {}
+        self.min_delta = min_delta
+        self.is_check  = is_check
+        self.monitors  = monitors
+        self.list_mtrs = []
+        self.i_step    = 0
+
+    def __str__(self):
+        return self.env.__str__()
+
+    def add_players(self, name: str | list[str] | np.ndarray[str], mu: float | list[float] | np.ndarray=None, sigma: float | list[float] | np.ndarray=None):
+        if isinstance(name, str): name = [name,]
+        if mu is None:
+            mu = [None] * len(name)
+        elif not isinstance(mu, (list, np.ndarray)):
+            mu = [mu] * len(name)
+        if sigma is None:
+            sigma = [None] * len(name)
+        elif not isinstance(sigma, (list, np.ndarray)):
+            sigma = [sigma] * len(name)
+        assert len(name) == len(mu) == len(sigma)
+        self.rating = self.rating | {x: self.env.create_rating(mu=y, sigma=z) for x, y, z in zip(name, mu, sigma)}
+
+    def update(self, *teams: str | list[str], ranks: list[int]=None, mask: list[bool]=None):
+        """
+        params::
+            ranks: over 1. 1 means top rank.
+        """
+        if self.is_check:
+            assert check_type_list(teams, [list, str], str)
+            assert check_type_list(ranks, int)
+            for x in ranks: assert x >= 1
+            assert len(teams) == len(ranks)
+            assert mask is None or check_type_list(mask, bool)
+            if mask is not None:
+                assert check_type_list(teams, list, str)
+                _n = len(teams[0])
+                for x in teams: assert len(x) == _n == len(mask)
+        teams     = [x if isinstance(x, (list, tuple)) else [x, ] for x in teams]
+        list_vals = self.env.rate([[self.rating[y] for y in x] for x in teams], ranks=ranks, min_delta=self.min_delta)
+        for x, a in zip(teams, list_vals):
+            for y, b in zip(x, a):
+                self.rating[y] = b
+        self.i_step += 1
+        if self.monitors is not None and self.i_step % 100 == 0:
+            self.list_mtrs.append({x: self.rating[x].mu for x in self.monitors})
+
+    def evaluate(self, teams: np.ndarray, ranks: np.ndarray=None, structure: list[int]=None):
+        if self.is_check:
+            assert isinstance(teams, np.ndarray) and len(teams.shape) == 2
+            assert isinstance(ranks, np.ndarray) and len(ranks.shape) == 2
+            assert teams.shape[0] == ranks.shape[0]
+            assert teams.dtype in [np.object_]
+            assert (ranks < 1).sum() == 0
+            if structure is None:
+                assert teams.shape == ranks.shape
+            else:
+                assert (len(structure) + 1) == ranks.shape[-1]
+                assert check_type_list(structure, int)
+        ratings = np.array([self.rating[x].mu for x in teams.reshape(-1)], dtype=float).reshape(teams.shape)
+        if structure is not None:
+            structure = [0, ] + structure + [teams.shape[-1], ]
+            ratings   = [ratings[:, structure[i]:structure[i+1]].sum(axis=-1) for i in range(len(structure) - 1)]
+            ratings   = np.stack(ratings).T
+        return evaluate_ndcg(np.argsort(np.argsort(-ratings)) + 1, ranks)
+
+    def monitors_to_pandas(self):
+        if self.monitors is not None:
+            return pd.DataFrame(self.list_mtrs)
+        else:
+            raise AttributeError(f"monitors is not set.")
+
+    def monitors_to_plot(self, figsize: tuple[int, int]=(10, 6)):
+        if self.monitors is not None:
+            df = pd.DataFrame(self.list_mtrs)
+            df.plot(figsize=figsize)
+            plt.xlabel('n steps ( x 100 )')
+            plt.ylabel('Rating')
+            plt.title(self.__str__())
+            plt.legend()
+            plt.show()
+        else:
+            raise AttributeError(f"monitors is not set.")
+    
