@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+from collections import defaultdict
 
 
 __all__ = [
@@ -8,19 +9,23 @@ __all__ = [
 
 
 class NumpyDict:
-    def __init__(self, is_check: bool=True, dtype=float, default_size: int | tuple[int, int]=1000, is_series: bool=False):
+    def __init__(self, is_check: bool=True, dtype=float, default_size: int | tuple[int, int]=1000, is_series: bool=False, init_values: float | list[float]=0.0):
         assert isinstance(is_check, bool)
         if isinstance(default_size, int):
             assert default_size > 0
+            assert isinstance(init_values, (int, float))
         else:
             assert isinstance(default_size, tuple)
             assert len(default_size) == 2
             assert default_size[0] > 0 and default_size[1] > 0
+            assert isinstance(init_values, list)
+            assert len(init_values) == len(default_size)
         self.is_check     = is_check
         self.is_series    = is_series
-        self.keys         = pd.Series(dtype=int) if is_series else {}
+        self.keys         = pd.Series(dtype=int) if is_series else defaultdict(lambda: -1)
         self.sets         = set()
-        self.values       = np.zeros(default_size, dtype=dtype)
+        self.values       = np.ones(default_size, dtype=dtype) * np.array(init_values, dtype=dtype)
+        self.init_values  = self.values.copy()
         self.dtype        = dtype
         self.default_size = default_size
         self.is_multi_dim = not isinstance(self.default_size, int)
@@ -85,7 +90,7 @@ class NumpyDict:
                 if self.is_series:
                     self.keys = pd.Series({x: i for i, x in enumerate(keys)})
                 else:
-                    self.keys = {x: i for i, x in enumerate(keys)}
+                    self.keys = self.keys | {x: i for i, x in enumerate(keys)}
                 self.values[np.arange(len(keys), dtype=int)] = values
             else:
                 keys   = np.array(keys, dtype=object)
@@ -120,7 +125,7 @@ class NumpyDict:
                 n_keys = len(self.keys)
                 self.keys[keys] = n_keys
                 if n_keys >= self.values.shape[0]:
-                    self.values = np.concatenate([self.values, np.zeros(self.default_size, dtype=self.dtype)], axis=0)
+                    self.values = np.concatenate([self.values, self.init_values.copy()], axis=0)
                 self.values[n_keys] = values
                 self.sets.add(keys)
     def to_dict(self) -> dict:

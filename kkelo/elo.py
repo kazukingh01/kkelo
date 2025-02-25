@@ -1,4 +1,5 @@
 from math import sqrt
+from collections import defaultdict
 import numpy as np
 import pandas as pd
 from scipy.stats import norm
@@ -18,14 +19,14 @@ __all__ = [
 
 
 class BaseRating:
-    def __init__(self, dtype=np.float32, default_size: int=1000000, n_round: int=3, is_check: bool=True, monitors: list[str] = None):
+    def __init__(self, dtype=np.float32, default_size: int=1000000, n_round: int=3, is_check: bool=True, monitors: list[str]=None, init_values: float | list[float]=0.):
         assert isinstance(is_check, bool)
         assert monitors is None or (isinstance(monitors, list) and check_type_list(monitors, str))
         assert isinstance(n_round, int) and n_round >= 0
         self.i_step   = 0
         self.is_check = is_check
         self.monitors = monitors
-        self.rating   = NumpyDict(is_check=False, dtype=dtype, default_size=default_size, is_series=False)
+        self.rating   = NumpyDict(is_check=False, dtype=dtype, default_size=default_size, is_series=False, init_values=init_values)
         self.dtype    = dtype
         self.n_round  = n_round
         self.idx_mtrs:  list[int]  = []
@@ -162,7 +163,7 @@ class Elo(BaseRating):
         assert isinstance(init_rating, (int, float))
         assert isinstance(diff,    int) and diff    > 0
         assert isinstance(k,       int) and k       > 0
-        super().__init__(dtype=dtype, default_size=default_size, n_round=n_round, is_check=is_check, monitors=monitors)
+        super().__init__(dtype=dtype, default_size=default_size, n_round=n_round, is_check=is_check, monitors=monitors, init_values=init_rating)
         self.init_rating = dtype(init_rating)
         self.diff        = diff
         self.k           = k
@@ -191,7 +192,7 @@ class Elo(BaseRating):
             assert rating.dtype == self.dtype
         self.rating.update(name, rating)
         if self.monitors is not None:
-            self.idx_mtrs = [self.rating.keys[x] for x in self.monitors]
+            self.idx_mtrs = [self.rating.keys.get(x) for x in self.monitors]
 
     def ratings_team(self, *teams: str | list[str], ratings: list[np.ndarray]=None) -> np.ndarray:
         if self.is_check:
@@ -277,7 +278,7 @@ class TrueSkill(BaseRating):
         assert beta     is None or (isinstance(beta,  (float, int)) and beta > 0)
         assert d_factor is None or (isinstance(d_factor,     float) and d_factor > 0)
         assert p_draw   is None or (isinstance(p_draw,       float) and p_draw   > 0)
-        super().__init__(dtype=dtype, default_size=(default_size, 2), n_round=n_round, is_check=is_check, monitors=monitors)
+        super().__init__(dtype=dtype, default_size=(default_size, 2), n_round=n_round, is_check=is_check, monitors=monitors, init_values=[mu, sigma])
         self.mu        = dtype(mu)
         self.sigma     = dtype(sigma) if sigma is not None else self.mu / 3
         self.var       = self.sigma ** 2
@@ -416,7 +417,7 @@ class TrueSkillOriginal:
         d_factor       = d_factor if d_factor is not None else sigma / 100.
         p_draw         = p_draw   if p_draw   is not None else 0.0
         self.env       = trueskill.TrueSkill(mu=mu, sigma=sigma, beta=beta, tau=d_factor, draw_probability=p_draw, backend=None)
-        self.rating    = {}
+        self.rating    = defaultdict(lambda: self.env.create_rating())
         self.min_delta = min_delta
         self.is_check  = is_check
         self.monitors  = monitors
