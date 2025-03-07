@@ -402,7 +402,7 @@ class TrueSkill(BaseRating):
 class TrueSkillOriginal:
     def __init__(
         self, mu: int | float=25.0, sigma: int | float=None, beta: int | float=None, d_factor: float=None, p_draw: float=None,
-        min_delta: float=10, is_check: bool=True, monitors: list[str] = None
+        min_delta: float=10, n_round: int=None, is_check: bool=True, monitors: list[str] = None
     ):
         assert isinstance(mu, (float, int)) and mu > 0
         assert sigma    is None or (isinstance(sigma, (float, int)) and sigma > 0)
@@ -410,6 +410,7 @@ class TrueSkillOriginal:
         assert d_factor is None or (isinstance(d_factor,     float) and d_factor > 0)
         assert p_draw   is None or (isinstance(p_draw,       float) and p_draw   > 0)
         assert isinstance(min_delta, (int, float)) and min_delta > 0
+        assert n_round  is None or (isinstance(n_round, int) and n_round > 0)
         assert isinstance(is_check, bool)
         assert monitors is None or (isinstance(monitors, list) and check_type_list(monitors, str))
         sigma          = sigma    if sigma    is not None else mu / 3.
@@ -419,6 +420,7 @@ class TrueSkillOriginal:
         self.env       = trueskill.TrueSkill(mu=mu, sigma=sigma, beta=beta, tau=d_factor, draw_probability=p_draw, backend=None)
         self.rating    = defaultdict(lambda: self.env.create_rating())
         self.min_delta = min_delta
+        self.n_round   = n_round
         self.is_check  = is_check
         self.monitors  = monitors
         self.list_mtrs = []
@@ -427,18 +429,25 @@ class TrueSkillOriginal:
     def __str__(self):
         return self.env.__str__()
 
-    def add_players(self, name: str | list[str] | np.ndarray[str], mu: float | list[float] | np.ndarray=None, sigma: float | list[float] | np.ndarray=None):
+    def add_players(self, name: str | list[str] | np.ndarray[str], mu: float | list[float] | np.ndarray=None, sigma: float | list[float] | np.ndarray=None, is_override: bool=True):
         if isinstance(name, str): name = [name,]
         if mu is None:
             mu = [None] * len(name)
         elif not isinstance(mu, (list, np.ndarray)):
-            mu = [mu] * len(name)
+            mu = [round(mu, self.n_round)] * len(name) if self.n_round is not None else [mu] * len(name)
+        else:
+            mu = [round(x, self.n_round) for x in mu] if self.n_round is not None else mu
         if sigma is None:
             sigma = [None] * len(name)
         elif not isinstance(sigma, (list, np.ndarray)):
-            sigma = [sigma] * len(name)
+            sigma = [round(sigma, self.n_round)] * len(name) if self.n_round is not None else [sigma] * len(name)
+        else:
+            sigma = [round(x, self.n_round) for x in sigma] if self.n_round is not None else sigma
         assert len(name) == len(mu) == len(sigma)
-        self.rating = self.rating | {x: self.env.create_rating(mu=y, sigma=z) for x, y, z in zip(name, mu, sigma)}
+        if is_override:
+            self.rating = self.rating | {x: self.env.create_rating(mu=y, sigma=z) for x, y, z in zip(name, mu, sigma)}
+        else:
+            self.rating = self.rating | {x: self.env.create_rating(mu=y, sigma=z) for x, y, z in zip(name, mu, sigma) if x not in self.rating}
 
     def update(self, *teams: str | list[str], ranks: list[int]=None, mask: list[bool]=None):
         """
@@ -458,8 +467,19 @@ class TrueSkillOriginal:
         teams     = [x if isinstance(x, (list, tuple)) else [x, ] for x in teams]
         list_vals = self.env.rate([[self.rating[y] for y in x] for x in teams], ranks=ranks, min_delta=self.min_delta)
         for x, a in zip(teams, list_vals):
-            for y, b in zip(x, a):
-                self.rating[y] = b
+            if mask is None:
+                for y, b in zip(x, a):
+                    if self.n_round is None:
+                        self.rating[y] = b
+                    else:
+                        self.rating[y] = self.env.create_rating(mu=round(b.mu, self.n_round), sigma=round(b.sigma, self.n_round))
+            else:
+                for y, b, is_mask in zip(x, a, mask):
+                    if is_mask:
+                        if self.n_round is None:
+                            self.rating[y] = b
+                        else:
+                            self.rating[y] = self.env.create_rating(mu=round(b.mu, self.n_round), sigma=round(b.sigma, self.n_round))
         self.i_step += 1
         if self.monitors is not None and self.i_step % 100 == 0:
             self.list_mtrs.append({x: self.rating[x].mu for x in self.monitors})
